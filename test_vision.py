@@ -82,26 +82,46 @@ def calibrate(frame):
     return template, Detection(x + width // 2, y + height // 2, 1.0)
 
 
+def template_variants(template):
+    """Match the whole sprite and a steadier upper part of the same selection."""
+    height, width = template.shape[:2]
+    regions = [(0, 0, width, height)]
+    if width >= 40 and height >= 32:
+        regions.append((width // 4, 0, 3 * width // 4, int(0.45 * height)))
+    variants = []
+    for left, top, right, bottom in regions:
+        patch = template[top:bottom, left:right]
+        _, deviation = cv2.meanStdDev(patch)
+        if float(deviation.max()) < 10:
+            continue
+        variants.append((patch, left, top))
+        variants.append((cv2.flip(patch, 1), width - right, top))
+    if not variants:
+        raise ValueError("Template has too little visual detail; run with --calibrate again.")
+    return variants
+
+
 def _best_match(frame, templates, region):
     left, top, right, bottom = region
     area = frame[top:bottom, left:right]
     best_score = -1.0
     best_location = None
-    for template in templates:
+    for template, offset_x, offset_y in templates:
         if area.shape[0] < template.shape[0] or area.shape[1] < template.shape[1]:
             continue
         result = cv2.matchTemplate(area, template, cv2.TM_CCOEFF_NORMED)
         _, score, _, location = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = score
-            best_location = (left + location[0], top + location[1])
+            best_location = (left + location[0] - offset_x,
+                             top + location[1] - offset_y)
     return best_score, best_location
 
 
 def detect_player(frame, templates, previous: Detection | None,
                   threshold: float, radius: int) -> Detection:
     height, width = frame.shape[:2]
-    template_height, template_width = templates[0].shape[:2]
+    template_height, template_width = templates[0][0].shape[:2]
     full = (0, 0, width, height)
     if previous is not None and previous.found:
         left = max(0, previous.x - template_width // 2 - radius)
@@ -175,26 +195,36 @@ def main() -> int:
             if template is None:
                 raise ValueError(f"No template at {TEMPLATE_PATH}; run once with --calibrate.")
             previous = None
-        templates = (template, cv2.flip(template, 1))
+        initial_size = frame.shape[:2]
+        if template.shape[0] > initial_size[0] or template.shape[1] > initial_size[1]:
+            raise ValueError("Saved template is larger than the game view; run with --calibrate again.")
+        templates = template_variants(template)
+        preview_hwnd = 0
         if args.display:
             cv2.namedWindow(PREVIEW_TITLE, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(PREVIEW_TITLE, min(frame.shape[1], 1200),
                              min(frame.shape[0], 800))
+            cv2.imshow(PREVIEW_TITLE, frame)
+            cv2.waitKey(1)
+            preview_hwnd = win32gui.FindWindow(None, PREVIEW_TITLE)
+            if not preview_hwnd:
+                raise RuntimeError("Could not find the OpenCV preview window; use without --display.")
         CAPTURES.mkdir(parents=True, exist_ok=True)
         with LOG_PATH.open("w", newline="", encoding="utf-8") as log_file:
             writer = csv.writer(log_file)
             writer.writerow(("elapsed_seconds", "x", "y", "confidence", "status"))
             start = time.monotonic()
-            next_frame = start
             print("Tracking. Move the player manually; press Ctrl+C or Q to stop.", flush=True)
             while True:
+                frame_started = time.monotonic()
                 # The OpenCV preview can cover the emulator on one monitor.
                 # Hide it during mss capture so its own pixels are not tracked.
-                preview_hwnd = win32gui.FindWindow(None, PREVIEW_TITLE) if args.display else 0
                 if preview_hwnd:
                     win32gui.ShowWindow(preview_hwnd, win32con.SW_HIDE)
                     time.sleep(0.02)
                 frame = read_frame(game.hwnd)
+                if frame.shape[:2] != initial_size:
+                    raise RuntimeError("Game window size changed; rerun with --calibrate.")
                 detection = detect_player(frame, templates, previous,
                                           args.threshold, args.search_radius)
                 previous = detection if detection.found else None
@@ -212,12 +242,13 @@ def main() -> int:
                       flush=True)
                 if args.display:
                     cv2.imshow(PREVIEW_TITLE, view)
+                    if preview_hwnd:
+                        win32gui.ShowWindow(preview_hwnd, win32con.SW_SHOWNA)
                     if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
                         break
                 if win32api.GetAsyncKeyState(ord("Q")) & 1:
                     break
-                next_frame += 1 / args.fps
-                time.sleep(max(0, next_frame - time.monotonic()))
+                time.sleep(max(0, 1 / args.fps - (time.monotonic() - frame_started)))
         print(f"Saved {ANNOTATED_PATH} and {LOG_PATH}", flush=True)
         return 0
     except KeyboardInterrupt:
