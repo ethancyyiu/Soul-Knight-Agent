@@ -1,0 +1,10 @@
+Game connection and controls
+Player detection and tracking
+Environment perceptionNextDetect enemies, projectiles, walls, doors, obstacles, health, energy, and weapons.
+Autonomous navigation
+Basic combat AI
+Projectile dodging and survival
+Boss fighting
+Game progression and decisions
+Autonomous full-game runs
+Learning and optimization

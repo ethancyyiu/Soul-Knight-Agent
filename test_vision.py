@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import ctypes
 import csv
 from dataclasses import dataclass
@@ -11,11 +12,13 @@ import sys
 import time
 
 import cv2
+import mss
+import numpy as np
 import win32api
 import win32con
 import win32gui
 
-from game_io import GameWindow, capture, list_windows, select_window
+from game_io import GameWindow, client_area, list_windows, select_window
 
 
 CAPTURES = Path("captures")
@@ -46,6 +49,9 @@ class Detection:
     x: int | None
     y: int | None
     confidence: float
+    width: int = 0
+    height: int = 0
+    variant: int = -1
 
     @property
     def found(self) -> bool:
@@ -66,7 +72,7 @@ def choose_window(title: str | None, hwnd: int | None) -> GameWindow:
     return select_window(windows)
 
 
-def read_frame(hwnd: int, preview_hwnd: int = 0):
+def read_frame(hwnd: int, preview_hwnd: int = 0, *, screen=None):
     foreground = win32gui.GetForegroundWindow()
     if foreground != hwnd and (not preview_hwnd or foreground != preview_hwnd):
         try:
@@ -77,14 +83,18 @@ def read_frame(hwnd: int, preview_hwnd: int = 0):
     foreground = win32gui.GetForegroundWindow()
     if foreground != hwnd and (not preview_hwnd or foreground != preview_hwnd):
         raise RuntimeError("Neither Soul Knight nor its excluded preview is foreground; capture would include other windows.")
-    capture(hwnd, LATEST_PATH)
-    frame = cv2.imread(str(LATEST_PATH), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise RuntimeError(f"Could not read screenshot {LATEST_PATH}.")
+    # Keep pixels in memory instead of encoding a PNG and decoding it again.
+    # A caller-owned mss session can reuse its Windows capture resources.
+    with nullcontext(screen) if screen is not None else getattr(mss, "MSS", mss.mss)() as session:
+        shot = session.grab(client_area(hwnd))
+        frame = cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+    LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(LATEST_PATH), frame):
+        raise RuntimeError(f"Could not save screenshot {LATEST_PATH}.")
     return frame
 
 
-def calibrate(frame, destination: Path, base_size: tuple[int, int] | None = None):
+def calibrate(frame, destination: Path):
     cv2.namedWindow("Select player sprite", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Select player sprite", min(frame.shape[1], 1200),
                      min(frame.shape[0], 800))
@@ -98,16 +108,6 @@ def calibrate(frame, destination: Path, base_size: tuple[int, int] | None = None
         raise ValueError("Selection cancelled or too small. Select the player's head and body.")
     if width > frame.shape[1] // 3 or height > frame.shape[0] // 3:
         raise ValueError("Selection is too large. Select only the player sprite.")
-    if base_size is not None:
-        base_width, base_height = base_size
-        if base_width > frame.shape[1] or base_height > frame.shape[0]:
-            raise ValueError("Game view is smaller than the base template; recalibrate.")
-        if abs(width - base_width) > base_width * 0.25 or abs(height - base_height) > base_height * 0.25:
-            raise ValueError("Additional selection must be close to the first template's size.")
-        center_x, center_y = x + width // 2, y + height // 2
-        x = max(0, min(frame.shape[1] - base_width, center_x - base_width // 2))
-        y = max(0, min(frame.shape[0] - base_height, center_y - base_height // 2))
-        width, height = base_width, base_height
     template = frame[y:y + height, x:x + width].copy()
     _, deviation = cv2.meanStdDev(template)
     if float(deviation.max()) < 10:
@@ -115,7 +115,7 @@ def calibrate(frame, destination: Path, base_size: tuple[int, int] | None = None
     CAPTURES.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(destination), template):
         raise RuntimeError(f"Could not save template to {destination}.")
-    return template, Detection(x + width // 2, y + height // 2, 1.0)
+    return template, Detection(x + width // 2, y + height // 2, 1.0, width, height)
 
 
 def load_template_bank():
@@ -123,13 +123,10 @@ def load_template_bank():
     if base is None:
         raise ValueError(f"No template at {TEMPLATE_PATH}; run once with --calibrate.")
     images = [base]
-    base_time = TEMPLATE_PATH.stat().st_mtime
     for path in sorted(CAPTURES.glob("player_template_*.png")):
-        if path.stat().st_mtime < base_time:
-            continue  # Older poses belong to a previous calibration.
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if image is None or image.shape != base.shape:
-            raise ValueError(f"Invalid appearance template {path}; recalibrate it.")
+        if image is None or min(image.shape[:2]) < 12:
+            raise ValueError(f"Invalid appearance template {path}; select a new pose.")
         images.append(image)
     return images
 
@@ -155,32 +152,73 @@ def template_variants(template):
         _, deviation = cv2.meanStdDev(patch)
         if float(deviation.max()) < 10:
             continue
-        variants.append((patch, left, top, template, helmet))
-        variants.append((cv2.flip(patch, 1), width - right, top,
-                         cv2.flip(template, 1), helmet))
+        flipped = cv2.flip(patch, 1)
+        variants.append((patch, left, top, template, helmet,
+                         cv2.resize(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY),
+                                    None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)))
+        variants.append((flipped, width - right, top,
+                         cv2.flip(template, 1), helmet,
+                         cv2.resize(cv2.cvtColor(flipped, cv2.COLOR_BGR2GRAY),
+                                    None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)))
     if not variants:
         raise ValueError("Template has too little visual detail; run with --calibrate again.")
     return variants
 
 
-def _best_match(frame, templates, region):
+def _best_match(frame, templates, region, preferred: int = -1, fast_accept: float = 1.0):
     left, top, right, bottom = region
     area = frame[top:bottom, left:right]
+    small = cv2.resize(cv2.cvtColor(area, cv2.COLOR_BGR2GRAY), None,
+                       fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     best_score = -1.0
     best_location = None
-    for template, offset_x, offset_y, whole, helmet in templates:
+    best_size = None
+    best_variant = -1
+    order = list(range(len(templates)))
+    if 0 <= preferred < len(templates):
+        order.remove(preferred)
+        order.insert(0, preferred)
+    for index in order:
+        template, offset_x, offset_y, whole, helmet, small_template = templates[index]
         if area.shape[0] < template.shape[0] or area.shape[1] < template.shape[1]:
             continue
-        result = cv2.matchTemplate(area, template, cv2.TM_CCOEFF_NORMED)
-        _, score, _, location = cv2.minMaxLoc(result)
-        candidate_x = left + location[0] - offset_x
-        candidate_y = top + location[1] - offset_y
+        if small.shape[0] < small_template.shape[0] or small.shape[1] < small_template.shape[1]:
+            continue
+        coarse = cv2.matchTemplate(small, small_template, cv2.TM_CCOEFF_NORMED)
+        whole_height, whole_width = whole.shape[:2]
+        valid_left = max(0, (offset_x - left + 1) // 2)
+        valid_top = max(0, (offset_y - top + 1) // 2)
+        valid_right = min(coarse.shape[1],
+                          (frame.shape[1] - whole_width + offset_x - left) // 2 + 1)
+        valid_bottom = min(coarse.shape[0],
+                           (frame.shape[0] - whole_height + offset_y - top) // 2 + 1)
+        if valid_right <= valid_left or valid_bottom <= valid_top:
+            continue
+        _, _, _, location = cv2.minMaxLoc(coarse[valid_top:valid_bottom,
+                                               valid_left:valid_right])
+        rough_x = 2 * (valid_left + location[0])
+        rough_y = 2 * (valid_top + location[1])
+        # Correct downsampling and animation offsets with a tiny color search.
+        refine_left = max(0, rough_x - 5)
+        refine_top = max(0, rough_y - 5)
+        refine_right = min(area.shape[1], rough_x + template.shape[1] + 6)
+        refine_bottom = min(area.shape[0], rough_y + template.shape[0] + 6)
+        result = cv2.matchTemplate(area[refine_top:refine_bottom,
+                                        refine_left:refine_right],
+                                   template, cv2.TM_CCOEFF_NORMED)
+        fine_left = max(0, offset_x - left - refine_left)
+        fine_top = max(0, offset_y - top - refine_top)
+        fine_right = min(result.shape[1], frame.shape[1] - whole_width +
+                         offset_x - left - refine_left + 1)
+        fine_bottom = min(result.shape[0], frame.shape[0] - whole_height +
+                          offset_y - top - refine_top + 1)
+        if fine_right <= fine_left or fine_bottom <= fine_top:
+            continue
+        _, score, _, precise = cv2.minMaxLoc(result[fine_top:fine_bottom,
+                                                  fine_left:fine_right])
+        candidate_x = left + refine_left + fine_left + precise[0] - offset_x
+        candidate_y = top + refine_top + fine_top + precise[1] - offset_y
         if helmet:
-            whole_height, whole_width = whole.shape[:2]
-            if (candidate_x < 0 or candidate_y < 0 or
-                    candidate_x + whole_width > frame.shape[1] or
-                    candidate_y + whole_height > frame.shape[0]):
-                continue
             crop = frame[candidate_y:candidate_y + whole_height,
                          candidate_x:candidate_x + whole_width]
             full_score = cv2.matchTemplate(crop, whole, cv2.TM_CCOEFF_NORMED)[0, 0]
@@ -188,76 +226,80 @@ def _best_match(frame, templates, region):
         if score > best_score:
             best_score = score
             best_location = (candidate_x, candidate_y)
-    return best_score, best_location
+            best_size = (whole_width, whole_height)
+            best_variant = index
+        # A small head patch can score highly at the wrong offset. Only a
+        # confident whole-sprite match is safe to accept without checking
+        # the remaining appearances.
+        if score >= fast_accept and template.shape == whole.shape:
+            break
+    return best_score, best_location, best_size, best_variant
 
 
-def _global_match(frame, templates, template_width: int, template_height: int):
-    """Find a few fast grayscale candidates, then score them in full color."""
+def _global_match(frame, templates):
+    """Locate each appearance cheaply, then verify it in full resolution color."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    small = cv2.resize(gray, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
     candidates = []
-    for patch, offset_x, offset_y, _, _ in templates:
-        small_patch = cv2.resize(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), None,
-                                 fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    for index, (patch, offset_x, offset_y, _, _, small_patch) in enumerate(templates):
+        small_patch = cv2.resize(small_patch, None, fx=0.5, fy=0.5,
+                                 interpolation=cv2.INTER_AREA)
         if small.shape[0] < small_patch.shape[0] or small.shape[1] < small_patch.shape[1]:
             continue
         result = cv2.matchTemplate(small, small_patch, cv2.TM_CCOEFF_NORMED)
         _, score, _, location = cv2.minMaxLoc(result)
-        candidates.append((score, 2 * location[0] - offset_x,
-                           2 * location[1] - offset_y))
-    candidates.sort(reverse=True)
-    best_score, best_location = -1.0, None
-    checked = []
-    for _, x, y in candidates:
-        if any(abs(x - old_x) < template_width // 2 and
-               abs(y - old_y) < template_height // 2 for old_x, old_y in checked):
-            continue
-        checked.append((x, y))
-        region = (max(0, x - 40), max(0, y - 40),
-                  min(frame.shape[1], x + template_width + 40),
-                  min(frame.shape[0], y + template_height + 40))
-        score, location = _best_match(frame, templates, region)
+        candidates.append((index, 4 * location[0] - offset_x,
+                           4 * location[1] - offset_y))
+    best_score, best_location, best_size, best_variant = -1.0, None, None, -1
+    for index, x, y in candidates:
+        whole = templates[index][3]
+        region = (max(0, x - 12), max(0, y - 12),
+                  min(frame.shape[1], x + whole.shape[1] + 12),
+                  min(frame.shape[0], y + whole.shape[0] + 12))
+        # Verify the appearance that proposed this location. Re-running the
+        # entire bank around every candidate multiplies the recovery cost.
+        score, location, size, _ = _best_match(frame, [templates[index]], region)
         if score > best_score:
-            best_score, best_location = score, location
-        if len(checked) == 3:
-            break
-    return best_score, best_location
+            best_score, best_location, best_size, best_variant = score, location, size, index
+    return best_score, best_location, best_size, best_variant
 
 
 def detect_player(frame, templates, previous: Detection | None,
                   threshold: float, radius: int) -> Detection:
     height, width = frame.shape[:2]
-    template_height, template_width = templates[0][0].shape[:2]
-    score, location = -1.0, None
+    template_width = max(variant[3].shape[1] for variant in templates)
+    template_height = max(variant[3].shape[0] for variant in templates)
+    score, location, size, variant = -1.0, None, None, -1
     if previous is not None and previous.found:
         left = max(0, previous.x - template_width // 2 - radius)
         top = max(0, previous.y - template_height // 2 - radius)
         right = min(width, previous.x + template_width // 2 + radius)
         bottom = min(height, previous.y + template_height // 2 + radius)
-        score, location = _best_match(frame, templates, (left, top, right, bottom))
-    if score < threshold:
-        global_score, global_location = _global_match(
-            frame, templates, template_width, template_height
+        score, location, size, variant = _best_match(
+            frame, templates, (left, top, right, bottom), previous.variant, fast_accept=0.90
         )
+    if score < threshold:
+        global_score, global_location, global_size, global_variant = _global_match(frame, templates)
         if global_score > score:
-            score, location = global_score, global_location
-    if location is None or score < threshold:
+            score, location, size, variant = (global_score, global_location,
+                                              global_size, global_variant)
+    if location is None or size is None or score < threshold:
         return Detection(None, None, max(0.0, score))
-    center_x = location[0] + template_width // 2
-    center_y = location[1] + template_height // 2
+    matched_width, matched_height = size
+    center_x = location[0] + matched_width // 2
+    center_y = location[1] + matched_height // 2
     if not 0 <= center_x < width or not 0 <= center_y < height:
         return Detection(None, None, max(0.0, score))
-    return Detection(center_x, center_y, score)
+    return Detection(center_x, center_y, score, matched_width, matched_height, variant)
 
 
-def annotate(frame, detection: Detection, template_width: int,
-             template_height: int, processing_fps: float):
+def annotate(frame, detection: Detection, processing_fps: float):
     view = frame.copy()
     if detection.found:
-        left = detection.x - template_width // 2
-        top = detection.y - template_height // 2
+        left = detection.x - detection.width // 2
+        top = detection.y - detection.height // 2
         cv2.rectangle(view, (left, top),
-                      (left + template_width, top + template_height), (0, 255, 0), 2)
+                      (left + detection.width, top + detection.height), (0, 255, 0), 2)
         label = f"TRACKING  ({detection.x}, {detection.y})  confidence {detection.confidence:.2f}"
         color = (0, 255, 0)
     else:
@@ -279,7 +321,7 @@ def main() -> int:
                         help="Window handle from test_connection.py --list (decimal or 0x hex)")
     calibration = parser.add_mutually_exclusive_group()
     calibration.add_argument("--calibrate", action="store_true",
-                             help="Select a fresh base template; older appearance templates are ignored")
+                             help="Replace the base template; saved appearance templates remain available")
     calibration.add_argument("--add-template", action="store_true",
                              help="Select another player pose to add to the appearance templates")
     parser.add_argument("--fps", type=float, default=5.0,
@@ -302,25 +344,29 @@ def main() -> int:
     if args.seconds is not None and args.seconds <= 0:
         parser.error("--seconds must be greater than 0.")
 
+    screen = None
     try:
         game = choose_window(args.title, args.hwnd)
         print(f"Selected: {game.title!r} (hwnd={game.hwnd:#x})", flush=True)
-        frame = read_frame(game.hwnd)
+        if args.calibrate and any(CAPTURES.glob("player_template_*.png")):
+            print("Recalibrating replaces the base template; saved pose templates remain active.", flush=True)
+        screen = getattr(mss, "MSS", mss.mss)()
+        frame = read_frame(game.hwnd, screen=screen)
         previous = None
         if args.calibrate:
             template, previous = calibrate(frame, TEMPLATE_PATH)
             print(f"Saved {TEMPLATE_PATH}; template size {template.shape[1]}x{template.shape[0]}",
                   flush=True)
         elif args.add_template:
-            base = load_template_bank()[0]
+            load_template_bank()  # Require an existing base calibration.
             path = next_template_path()
-            _, previous = calibrate(frame, path, (base.shape[1], base.shape[0]))
+            _, previous = calibrate(frame, path)
             print(f"Saved additional appearance: {path}", flush=True)
         bank = load_template_bank()
-        template = bank[0]
         initial_size = frame.shape[:2]
-        if template.shape[0] > initial_size[0] or template.shape[1] > initial_size[1]:
-            raise ValueError("Saved template is larger than the game view; run with --calibrate again.")
+        if any(image.shape[0] > initial_size[0] or image.shape[1] > initial_size[1]
+               for image in bank):
+            raise ValueError("A saved template is larger than the game view; check the window size.")
         templates = [variant for image in bank for variant in template_variants(image)]
         print(f"Using {len(bank)} appearance template(s).", flush=True)
         preview_hwnd = 0
@@ -365,7 +411,7 @@ def main() -> int:
                     print("Resumed tracking.", flush=True)
                     paused_for_focus = False
                 frame_started = time.monotonic()
-                frame = read_frame(game.hwnd, preview_hwnd)
+                frame = read_frame(game.hwnd, preview_hwnd, screen=screen)
                 if frame.shape[:2] != initial_size:
                     raise RuntimeError("Game window size changed; rerun with --calibrate.")
                 detection = detect_player(frame, templates, previous,
@@ -381,8 +427,7 @@ def main() -> int:
                     cv2.imwrite(str(LOST_PATH), frame)
                     lost_snapshot_saved = True
                 processing_fps = 1 / max(0.001, time.monotonic() - frame_started)
-                view = annotate(frame, detection, template.shape[1], template.shape[0],
-                                processing_fps)
+                view = annotate(frame, detection, processing_fps)
                 if not cv2.imwrite(str(ANNOTATED_PATH), view):
                     raise RuntimeError(f"Could not save {ANNOTATED_PATH}.")
                 elapsed = time.monotonic() - start
@@ -413,7 +458,7 @@ def main() -> int:
                     break
                 if key in (ord("t"), ord("T")) or t_pressed:
                     path = next_template_path()
-                    _, previous = calibrate(frame, path, (template.shape[1], template.shape[0]))
+                    _, previous = calibrate(frame, path)
                     bank = load_template_bank()
                     templates = [variant for image in bank for variant in template_variants(image)]
                     print(f"Added pose {path}; using {len(bank)} templates.", flush=True)
@@ -430,6 +475,8 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
+        if screen is not None:
+            screen.close()
         cv2.destroyAllWindows()
 
 
